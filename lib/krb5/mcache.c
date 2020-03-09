@@ -150,9 +150,7 @@ mcc_alloc_inst(krb5_context context, const char *name, krb5_mcache **out)
     if (m_c) {
         m = m_c;
         /* We raced with another thread to create this cache */
-        HEIMDAL_MUTEX_lock(&(m->mutex));
-        m->refcnt++;
-        HEIMDAL_MUTEX_unlock(&(m->mutex));
+        heim_base_atomic_inc(&m->refcnt);
         *out = m;
         return 0;
     }
@@ -272,16 +270,14 @@ static int
 mcc_close_internal(krb5_mcache *m)
 {
     int ret = 0;
-    HEIMDAL_MUTEX_lock(&(m->mutex));
     heim_assert(m->refcnt != 0, "closed dead cache mcache");
-    if (--m->refcnt == 0) {
+    if (heim_base_atomic_dec(&m->refcnt) == 0) {
         if (MISDEAD(m)) {
             free(m->name);
             m->name = NULL;
             ret = 1;
         }
     }
-    HEIMDAL_MUTEX_unlock(&(m->mutex));
     return ret;
 }
 
@@ -309,26 +305,14 @@ mcc_destroy(krb5_context context,
 {
     krb5_mcache **n, *m = MCACHE(id);
 
-    /* XXX: order of lock acquisition must be consistent with that of other
-     * routines in order to avoid possibility of deadlock due to lock order */
-
-    if (!m->anonymous) HEIMDAL_MUTEX_lock(&mcc_mutex);
-    if (!m->anonymous) HEIMDAL_MUTEX_lock(&(m->mutex));
     if (m->refcnt == 0)
-    {
-        if (!m->anonymous) HEIMDAL_MUTEX_unlock(&(m->mutex));
-        if (!m->anonymous) HEIMDAL_MUTEX_unlock(&mcc_mutex);
     	krb5_abortx(context, "mcc_destroy: refcnt already 0");
-    }
 
     if (!MISDEAD(m)) {
 	/* if this is an active mcache, remove it from the linked
            list, and free all data */
         if (!m->anonymous) {
-            /* XXX: scope needed for mcc_mutex lock could be further limited to
-             * here rather than top and bottom of this routine if modification
-             * to &m->mutex (incr, decr) and get (read) were made atomic */
-            /*HEIMDAL_MUTEX_lock(&mcc_mutex);*/
+            HEIMDAL_MUTEX_lock(&mcc_mutex);
             for(n = &mcc_head; n && *n; n = &(*n)->next) {
                 if(m == *n) {
                     *n = m->next;
@@ -336,12 +320,12 @@ mcc_destroy(krb5_context context,
                     break;
                 }
             }
-            /*HEIMDAL_MUTEX_unlock(&mcc_mutex);*/
+            HEIMDAL_MUTEX_unlock(&mcc_mutex);
 	}
+        if (!m->anonymous) HEIMDAL_MUTEX_lock(&(m->mutex));
 	mcc_destroy_internal(context, m);
+        if (!m->anonymous) HEIMDAL_MUTEX_unlock(&(m->mutex));
     }
-    if (!m->anonymous) HEIMDAL_MUTEX_unlock(&(m->mutex));
-    if (!m->anonymous) HEIMDAL_MUTEX_unlock(&mcc_mutex);
     return 0;
 }
 
@@ -501,11 +485,8 @@ mcc_get_cache_first(krb5_context context, krb5_cc_cursor *cursor)
 
     HEIMDAL_MUTEX_lock(&mcc_mutex);
     iter->cache = mcc_head;
-    if (iter->cache) {
-	HEIMDAL_MUTEX_lock(&(iter->cache->mutex));
-	iter->cache->refcnt++;
-	HEIMDAL_MUTEX_unlock(&(iter->cache->mutex));
-    }
+    if (iter->cache)
+        heim_base_atomic_inc(&iter->cache->refcnt);
     HEIMDAL_MUTEX_unlock(&mcc_mutex);
 
     *cursor = iter;
@@ -528,14 +509,9 @@ mcc_get_cache_next(krb5_context context, krb5_cc_cursor cursor, krb5_ccache *id)
 
     HEIMDAL_MUTEX_lock(&mcc_mutex);
     m = iter->cache;
-    if (m->next)
-    {
-    	HEIMDAL_MUTEX_lock(&(m->next->mutex));
-    	m->next->refcnt++;
-    	HEIMDAL_MUTEX_unlock(&(m->next->mutex));
-    }
-
     iter->cache = m->next;
+    if (iter->cache)
+        heim_base_atomic_inc(&iter->cache->refcnt);
     HEIMDAL_MUTEX_unlock(&mcc_mutex);
 
     (*id)->data.data = m;
